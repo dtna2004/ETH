@@ -122,6 +122,12 @@ def main():
         initial_sidebar_state='expanded'
     )
     
+    # Khởi tạo session state nếu chưa có
+    if 'target_price' not in st.session_state:
+        st.session_state.target_price = None
+    if 'percent_change' not in st.session_state:
+        st.session_state.percent_change = 0.0
+    
     st.title('ETH Price Prediction App 🚀')
     
     app = ETHPredictionApp()
@@ -143,16 +149,55 @@ def main():
         current_price = float(app.collector.get_historical_data(days=1)['close'].iloc[-1])
         st.metric('Giá ETH hiện tại', f'${current_price:,.2f}')
         
-        target_price = st.number_input(
-            'Nhập giá mục tiêu (USDT):',
-            min_value=0.0,
-            value=current_price * 1.1,
-            step=100.0,
-            format='%.2f'
+        # Thêm radio button để chọn cách nhập giá mục tiêu
+        input_method = st.radio(
+            "Chọn cách nhập giá mục tiêu:",
+            ["Nhập giá trực tiếp", "Chọn % thay đổi"],
+            key='input_method'
         )
+        
+        if input_method == "Nhập giá trực tiếp":
+            # Sử dụng session state để lưu giá trị
+            if st.session_state.target_price is None:
+                st.session_state.target_price = current_price
+            
+            price_str = st.text_input(
+                'Nhập giá mục tiêu (USDT):',
+                value=str(st.session_state.target_price),
+                key='price_input'
+            )
+            
+            try:
+                target_price = float(price_str)
+                st.session_state.target_price = target_price
+            except ValueError:
+                st.error('Vui lòng nhập một số hợp lệ')
+                target_price = st.session_state.target_price
+        else:
+            # Sử dụng session state cho % thay đổi
+            percent_change = st.slider(
+                'Chọn % thay đổi giá:',
+                min_value=-50.0,
+                max_value=50.0,
+                value=st.session_state.percent_change,
+                step=0.1,
+                format='%+.1f%%',
+                key='percent_slider'
+            )
+            st.session_state.percent_change = percent_change
+            target_price = current_price * (1 + percent_change/100)
+            st.write(f'Giá mục tiêu: ${target_price:,.2f}')
         
         price_change = ((target_price - current_price) / current_price) * 100
         st.write(f'Thay đổi giá: {price_change:+.2f}%')
+        
+        # Thêm visual feedback về hướng thay đổi giá
+        if price_change > 0:
+            st.markdown('🔼 Dự đoán tăng giá')
+        elif price_change < 0:
+            st.markdown('🔽 Dự đoán giảm giá')
+        else:
+            st.markdown('➡️ Giá không đổi')
     
     if st.button('Dự đoán xác suất', use_container_width=True):
         probabilities = app.predict_probability(target_price, timeframe)
@@ -177,12 +222,90 @@ def main():
     if app.collector.prediction_history['predictions']:
         df = pd.DataFrame(app.collector.prediction_history['predictions'])
         df['timestamp'] = pd.to_datetime(df['timestamp'])
+        
+        # Lấy dữ liệu giá realtime một lần
+        latest_data = app.collector.get_historical_data(days=7)
+        latest_data.set_index('timestamp', inplace=True)
+        
+        # Thêm cột trạng thái
+        def get_status(row):
+            if 'verified' in row:
+                if row['verified']['is_correct']:
+                    return f'✅ Đạt (Cao: ${row["verified"]["period_high"]:,.2f}, Thấp: ${row["verified"]["period_low"]:,.2f})'
+                return f'❌ Không đạt (Cao: ${row["verified"]["period_high"]:,.2f}, Thấp: ${row["verified"]["period_low"]:,.2f})'
+            
+            # Kiểm tra xem đã hết thời gian chưa
+            pred_time = pd.to_datetime(row['timestamp'])
+            timeframe_delta = {
+                '1h': timedelta(minutes=61),
+                '4h': timedelta(hours=4, minutes=1),
+                '12h': timedelta(hours=12, minutes=1),
+                '24h': timedelta(hours=24, minutes=1),
+                '3d': timedelta(days=3),
+                '7d': timedelta(days=7)
+            }
+            
+            end_time = pred_time + timeframe_delta[row['timeframe']]
+            
+            # Nếu chưa hết thời gian, hiển thị thời gian còn lại
+            if datetime.now() < end_time:
+                time_left = end_time - datetime.now()
+                hours = int(time_left.total_seconds() // 3600)
+                minutes = int((time_left.total_seconds() % 3600) // 60)
+                if hours > 0:
+                    return f'🕒 Còn {hours}h {minutes}m'
+                return f'🕒 Còn {minutes}m'
+            
+            # Nếu đã hết thời gian, kiểm tra kết quả ngay
+            try:
+                period_data = latest_data.loc[
+                    (latest_data.index >= pred_time) &
+                    (latest_data.index <= end_time)
+                ]
+                
+                if not period_data.empty:
+                    target_price = row['target_price']
+                    current_price = row['current_price']
+                    period_high = period_data['high'].max()
+                    period_low = period_data['low'].min()
+                    
+                    # Kiểm tra kết quả
+                    if target_price > current_price:
+                        is_correct = period_high >= target_price
+                    else:
+                        is_correct = period_low <= target_price
+                        
+                    if is_correct:
+                        return f'✅ Đạt (Cao: ${period_high:,.2f}, Thấp: ${period_low:,.2f})'
+                    return f'❌ Không đạt (Cao: ${period_high:,.2f}, Thấp: ${period_low:,.2f})'
+                    
+            except Exception as e:
+                st.error(f"Lỗi khi kiểm tra kết quả: {str(e)}")
+                
+            return '⚠️ Lỗi xác nhận'
+        
+        df['trạng_thái'] = df.apply(get_status, axis=1)
         df = df.sort_values('timestamp', ascending=False)
         
+        # Format các cột giá
+        df['current_price'] = df['current_price'].apply(lambda x: f'${x:,.2f}')
+        df['target_price'] = df['target_price'].apply(lambda x: f'${x:,.2f}')
+        
+        # Hiển thị với tên cột tiếng Việt
         st.dataframe(
-            df[['timestamp', 'current_price', 'target_price', 'timeframe']],
+            df.rename(columns={
+                'timestamp': 'Thời gian',
+                'current_price': 'Giá hiện tại',
+                'target_price': 'Giá mục tiêu',
+                'timeframe': 'Khung thời gian',
+                'trạng_thái': 'Trạng thái'
+            })[['Thời gian', 'Giá hiện tại', 'Giá mục tiêu', 'Khung thời gian', 'Trạng thái']],
             use_container_width=True
         )
+        
+        # Thêm nút làm mới
+        if st.button('Làm mới dữ liệu', use_container_width=True):
+            st.rerun()
     else:
         st.info('Chưa có dự đoán nào được lưu.')
     
